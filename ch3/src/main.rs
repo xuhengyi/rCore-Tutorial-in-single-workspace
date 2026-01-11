@@ -7,7 +7,7 @@ mod task;
 #[macro_use]
 extern crate rcore_console;
 
-use impls::{Console, SyscallContext};
+use impls::{monotonic_time_ms, Console, SyscallContext};
 use rcore_console::log;
 use riscv::register::*;
 use sbi_rt::*;
@@ -25,6 +25,7 @@ extern "C" fn rust_main() -> ! {
     unsafe { linker::KernelLayout::locate().zero_bss() };
     // 初始化 `console`
     rcore_console::init_console(&Console);
+    rcore_console::set_timestamp(monotonic_time_ms);
     rcore_console::set_log_level(option_env!("LOG"));
     rcore_console::test_log();
     // 初始化 syscall
@@ -113,6 +114,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 /// 各种接口库的实现
 mod impls {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use riscv::register::time;
     use syscall::*;
 
     pub struct Console;
@@ -132,7 +135,7 @@ mod impls {
         fn write(&self, _caller: syscall::Caller, fd: usize, buf: usize, count: usize) -> isize {
             match fd {
                 STDOUT | STDDEBUG => {
-                    print!("{}", unsafe {
+                    print_with_timestamp(unsafe {
                         core::str::from_utf8_unchecked(core::slice::from_raw_parts(
                             buf as *const u8,
                             count,
@@ -167,7 +170,7 @@ mod impls {
         fn clock_gettime(&self, _caller: syscall::Caller, clock_id: ClockId, tp: usize) -> isize {
             match clock_id {
                 ClockId::CLOCK_MONOTONIC => {
-                    let time = riscv::register::time::read() * 10000 / 125;
+                    let time = monotonic_time_ns();
                     *unsafe { &mut *(tp as *mut TimeSpec) } = TimeSpec {
                         tv_sec: time / 1_000_000_000,
                         tv_nsec: time % 1_000_000_000,
@@ -177,5 +180,30 @@ mod impls {
                 _ => -1,
             }
         }
+    }
+
+    static LINE_START: AtomicBool = AtomicBool::new(true);
+
+    fn monotonic_time_ns() -> usize {
+        (time::read64() as u64 * 10000 / 125) as usize
+    }
+
+    #[inline]
+    pub(crate) fn monotonic_time_ms() -> usize {
+        monotonic_time_ns() / 1_000_000
+    }
+
+    fn print_with_timestamp(s: &str) {
+        let mut at_line_start = LINE_START.load(Ordering::Relaxed);
+        for segment in s.split_inclusive('\n') {
+            if at_line_start {
+                let ts_ms = monotonic_time_ns() / 1_000_000;
+                // Format: "[   10 ms] " with fixed width for readability.
+                print!("[{ts_ms:>5} ms] ");
+            }
+            print!("{segment}");
+            at_line_start = segment.ends_with('\n');
+        }
+        LINE_START.store(at_line_start, Ordering::Relaxed);
     }
 }

@@ -30,11 +30,20 @@ pub trait Console: Sync {
 
 /// 库找到输出的方法：保存一个对象引用，这是一种单例。
 static CONSOLE: Once<&'static dyn Console> = Once::new();
+/// 可选的时间戳提供函数，返回毫秒。
+static TIMESTAMP_MS: Once<fn() -> usize> = Once::new();
 
 /// 用户调用这个函数设置输出的方法。
 pub fn init_console(console: &'static dyn Console) {
     CONSOLE.call_once(|| console);
     log::set_logger(&Logger).unwrap();
+}
+
+/// 设置时间戳函数（毫秒）。
+///
+/// 如果不设置，则日志不会带时间前缀。
+pub fn set_timestamp(provider: fn() -> usize) {
+    TIMESTAMP_MS.call_once(|| provider);
 }
 
 /// 根据环境变量设置日志级别。
@@ -118,11 +127,21 @@ impl log::Log for Logger {
             Debug => 32,
             Trace => 90,
         };
-        println!(
-            "\x1b[{color_code}m[{:>5}] {}\x1b[0m",
-            record.level(),
-            record.args(),
-        );
+
+        if let Some(ts) = TIMESTAMP_MS.get().copied() {
+            let ts = ts();
+            println!(
+                "\x1b[{color_code}m[{ts:>5} ms] [{:>5}] {}\x1b[0m",
+                record.level(),
+                record.args(),
+            );
+        } else {
+            println!(
+                "\x1b[{color_code}m[{:>5}] {}\x1b[0m",
+                record.level(),
+                record.args(),
+            );
+        }
     }
 
     fn flush(&self) {}

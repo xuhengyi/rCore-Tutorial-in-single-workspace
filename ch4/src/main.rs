@@ -44,6 +44,7 @@ extern "C" fn rust_main() -> ! {
     unsafe { layout.zero_bss() };
     // 初始化 `console`
     rcore_console::init_console(&Console);
+    rcore_console::set_timestamp(impls::monotonic_time_ms);
     rcore_console::set_log_level(option_env!("LOG"));
     rcore_console::test_log();
     // 初始化内核堆
@@ -195,11 +196,16 @@ fn kernel_space(
 mod impls {
     use crate::PROCESSES;
     use alloc::alloc::alloc_zeroed;
-    use core::{alloc::Layout, ptr::NonNull};
+    use core::{
+        alloc::Layout,
+        ptr::NonNull,
+        sync::atomic::{AtomicBool, Ordering},
+    };
     use kernel_vm::{
         page_table::{MmuMeta, Pte, Sv39, VAddr, VmFlags, PPN, VPN},
         PageManager,
     };
+    use riscv::register::time;
     use rcore_console::log;
     use syscall::*;
 
@@ -289,7 +295,7 @@ mod impls {
                         .address_space
                         .translate(VAddr::new(buf), READABLE)
                     {
-                        print!("{}", unsafe {
+                        print_with_timestamp(unsafe {
                             core::str::from_utf8_unchecked(core::slice::from_raw_parts(
                                 ptr.as_ptr(),
                                 count,
@@ -334,7 +340,7 @@ mod impls {
                         .address_space
                         .translate(VAddr::new(tp), WRITABLE)
                     {
-                        let time = riscv::register::time::read() * 10000 / 125;
+                        let time = monotonic_time_ns();
                         *unsafe { ptr.as_mut() } = TimeSpec {
                             tv_sec: time / 1_000_000_000,
                             tv_nsec: time % 1_000_000_000,
@@ -348,5 +354,30 @@ mod impls {
                 _ => -1,
             }
         }
+    }
+
+    static LINE_START: AtomicBool = AtomicBool::new(true);
+
+    #[inline]
+    pub(crate) fn monotonic_time_ms() -> usize {
+        monotonic_time_ns() / 1_000_000
+    }
+
+    #[inline]
+    fn monotonic_time_ns() -> usize {
+        (time::read64() as u64 * 10000 / 125) as usize
+    }
+
+    fn print_with_timestamp(s: &str) {
+        let mut at_line_start = LINE_START.load(Ordering::Relaxed);
+        for segment in s.split_inclusive('\n') {
+            if at_line_start {
+                let ts_ms = monotonic_time_ms();
+                print!("[{ts_ms:>5} ms] ");
+            }
+            print!("{segment}");
+            at_line_start = segment.ends_with('\n');
+        }
+        LINE_START.store(at_line_start, Ordering::Relaxed);
     }
 }
