@@ -18,3 +18,4 @@ linker = { path = "../linker" }
 
 [features]
 coop = []
+nobios = []

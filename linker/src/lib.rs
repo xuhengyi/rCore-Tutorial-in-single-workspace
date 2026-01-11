@@ -36,7 +36,7 @@ mod app;
 
 pub use app::{AppIterator, AppMeta};
 
-/// 链接脚本。
+/// 链接脚本（使用 RustSBI）。
 pub const SCRIPT: &[u8] = b"\
 OUTPUT_ARCH(riscv)
 SECTIONS {
@@ -66,6 +66,67 @@ SECTIONS {
         KEEP(*(.boot.stack))
     }
     __end = .;
+}";
+
+/// 链接脚本（无 BIOS，直接从 M-Mode 启动）。
+///
+/// M-Mode 代码从 0x80000000 开始，S-Mode 内核从 0x80200000 开始。
+pub const SCRIPT_NOBIOS: &[u8] = b"\
+OUTPUT_ARCH(riscv)
+ENTRY(_m_start)
+SECTIONS {
+    /* M-Mode code and data, starting at 0x80000000 */
+    . = 0x80000000;
+    __m_start = .;
+
+    .text.m_entry : {
+        *(.text.m_entry)
+    }
+
+    .text.m_trap : {
+        *(.text.m_trap)
+    }
+
+    . = ALIGN(4K);
+    .bss.m_stack : {
+        *(.bss.m_stack)
+    }
+
+    . = ALIGN(4K);
+    __m_end = .;
+
+    /* S-Mode kernel, starting at 0x80200000 */
+    . = 0x80200000;
+    .text : {
+        __start = .;
+        *(.text.entry)
+        *(.text .text.*)
+    }
+    .rodata : ALIGN(4K) {
+        __rodata = .;
+        *(.rodata .rodata.*)
+        *(.srodata .srodata.*)
+    }
+    .data : ALIGN(4K) {
+        __data = .;
+        *(.data .data.*)
+        *(.sdata .sdata.*)
+    }
+    .bss : ALIGN(8) {
+        __sbss = .;
+        *(.bss .bss.*)
+        *(.sbss .sbss.*)
+        __ebss = .;
+    }
+    .boot : ALIGN(4K) {
+        __boot = .;
+        KEEP(*(.boot.stack))
+    }
+    __end = .;
+
+    /DISCARD/ : {
+        *(.eh_frame)
+    }
 }";
 
 /// 定义内核入口。

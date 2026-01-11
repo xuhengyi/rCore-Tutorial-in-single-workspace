@@ -64,6 +64,9 @@ struct BuildArgs {
     /// build in release mode
     #[clap(long)]
     release: bool,
+    /// build without BIOS (M-Mode entry)
+    #[clap(long)]
+    nobios: bool,
 }
 
 impl BuildArgs {
@@ -97,6 +100,9 @@ impl BuildArgs {
             })
             .conditional(self.release, |cargo| {
                 cargo.release();
+            })
+            .conditional(self.nobios, |cargo| {
+                cargo.features(false, ["nobios"]);
             })
             .target(TARGET_ARCH);
         for (key, value) in env {
@@ -153,12 +159,23 @@ impl QemuArgs {
         }
         let mut qemu = Qemu::system("riscv64");
         qemu.args(&["-machine", "virt"])
-            .arg("-nographic")
-            .arg("-bios")
-            .arg(PROJECT.join("rustsbi-qemu.bin"))
-            .arg("-kernel")
-            .arg(objcopy(elf, true))
-            .args(&["-smp", &self.smp.unwrap_or(1).to_string()])
+            .arg("-nographic");
+
+        // 根据 nobios 模式选择不同的启动方式
+        if self.build.nobios {
+            // 无 BIOS 模式：使用 -bios none，内核直接作为 -kernel 参数
+            qemu.args(&["-bios", "none"])
+                .arg("-kernel")
+                .arg(objcopy(&elf, true));
+        } else {
+            // 使用 RustSBI 模式
+            qemu.arg("-bios")
+                .arg(PROJECT.join("rustsbi-qemu.bin"))
+                .arg("-kernel")
+                .arg(objcopy(&elf, true));
+        }
+
+        qemu.args(&["-smp", &self.smp.unwrap_or(1).to_string()])
             .args(&["-m", "64M"])
             .args(&["-serial", "mon:stdio"]);
         if self.build.ch > 5 {

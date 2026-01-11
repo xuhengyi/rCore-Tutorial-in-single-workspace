@@ -4,6 +4,9 @@
 
 mod process;
 
+#[cfg(feature = "nobios")]
+mod msbi;
+
 #[macro_use]
 extern crate rcore_console;
 
@@ -29,6 +32,11 @@ use xmas_elf::ElfFile;
 
 // 应用程序内联进来。
 core::arch::global_asm!(include_str!(env!("APP_ASM")));
+
+// M-Mode 入口汇编（仅在 nobios 模式下）
+#[cfg(feature = "nobios")]
+core::arch::global_asm!(include_str!("m_entry.S"));
+
 // 定义内核入口。
 linker::boot0!(rust_main; stack = 6 * 4096);
 // 物理内存容量 = 24 MiB。
