@@ -26,3 +26,6 @@ members = [
 ]
 default-members = ["xtask"]
 resolver = "2"
+
+[patch.crates-io]
+page-table = { path = "patches/page-table" }

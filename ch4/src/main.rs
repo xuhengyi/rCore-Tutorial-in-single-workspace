@@ -13,36 +13,52 @@ extern crate rcore_console;
 extern crate alloc;
 
 use crate::{
-    impls::{Sv39Manager, SyscallContext},
+    impls::SyscallContext,
     process::Process,
 };
 use alloc::{alloc::alloc, vec::Vec};
 use core::alloc::Layout;
 use impls::Console;
 use kernel_context::{foreign::MultislotPortal, LocalContext};
-use kernel_vm::{
-    page_table::{MmuMeta, Sv39, VAddr, VmFlags, VmMeta, PPN, VPN},
-    AddressSpace,
-};
 use rcore_console::log;
 use riscv::register::*;
 use sbi_rt::*;
 use syscall::Caller;
 use xmas_elf::ElfFile;
 
+// 根据架构选择页表模式
+#[cfg(target_pointer_width = "64")]
+use impls::Sv39Manager as VmManager;
+#[cfg(target_pointer_width = "64")]
+use kernel_vm::page_table::Sv39 as VmMode;
+
+#[cfg(target_pointer_width = "32")]
+use impls::Sv32Manager as VmManager;
+#[cfg(target_pointer_width = "32")]
+use kernel_vm::page_table::Sv32 as VmMode;
+
+use kernel_vm::{
+    page_table::{MmuMeta, VAddr, VmFlags, VmMeta, PPN, VPN},
+    AddressSpace,
+};
+
 // 应用程序内联进来。
 core::arch::global_asm!(include_str!(env!("APP_ASM")));
 
 // M-Mode 入口汇编（仅在 nobios 模式下）
-#[cfg(feature = "nobios")]
-core::arch::global_asm!(include_str!("m_entry.S"));
+// 根据目标架构选择正确的汇编文件
+#[cfg(all(feature = "nobios", target_pointer_width = "64"))]
+core::arch::global_asm!(include_str!("m_entry_rv64.S"));
+
+#[cfg(all(feature = "nobios", target_pointer_width = "32"))]
+core::arch::global_asm!(include_str!("m_entry_rv32.S"));
 
 // 定义内核入口。
 linker::boot0!(rust_main; stack = 6 * 4096);
 // 物理内存容量 = 24 MiB。
 const MEMORY: usize = 24 << 20;
 // 传送门所在虚页。
-const PROTAL_TRANSIT: VPN<Sv39> = VPN::MAX;
+const PROTAL_TRANSIT: VPN<VmMode> = VPN::MAX;
 // 进程列表。
 static mut PROCESSES: Vec<Process> = Vec::new();
 
@@ -65,12 +81,12 @@ extern "C" fn rust_main() -> ! {
     };
     // 建立异界传送门
     let portal_size = MultislotPortal::calculate_size(1);
-    let portal_layout = Layout::from_size_align(portal_size, 1 << Sv39::PAGE_BITS).unwrap();
+    let portal_layout = Layout::from_size_align(portal_size, 1 << VmMode::PAGE_BITS).unwrap();
     let portal_ptr = unsafe { alloc(portal_layout) };
-    assert!(portal_layout.size() < 1 << Sv39::PAGE_BITS);
+    assert!(portal_layout.size() < 1 << VmMode::PAGE_BITS);
     // 建立内核地址空间
     let mut ks = kernel_space(layout, MEMORY, portal_ptr as _);
-    let portal_idx = PROTAL_TRANSIT.index_in(Sv39::MAX_LEVEL);
+    let portal_idx = PROTAL_TRANSIT.index_in(VmMode::MAX_LEVEL);
     // 加载应用程序
     for (i, elf) in linker::AppMeta::locate().iter().enumerate() {
         let base = elf.as_ptr() as usize;
@@ -83,18 +99,37 @@ extern "C" fn rust_main() -> ! {
     }
 
     // 建立调度栈
-    const PAGE: Layout =
-        unsafe { Layout::from_size_align_unchecked(2 << Sv39::PAGE_BITS, 1 << Sv39::PAGE_BITS) };
+    let page_layout: Layout =
+        unsafe { Layout::from_size_align_unchecked(2 << VmMode::PAGE_BITS, 1 << VmMode::PAGE_BITS) };
     let pages = 2;
-    let stack = unsafe { alloc(PAGE) };
+    let stack = unsafe { alloc(page_layout) };
+    
+    // RV64: 使用更大的地址空间
+    #[cfg(target_pointer_width = "64")]
+    let stack_top_vpn = 1usize << 26;
+    // RV32: 使用较小的地址空间 (Sv32: 20-bit VPN)
+    #[cfg(target_pointer_width = "32")]
+    let stack_top_vpn = 1usize << 19;
+    
     ks.map_extern(
-        VPN::new((1 << 26) - pages)..VPN::new(1 << 26),
-        PPN::new(stack as usize >> Sv39::PAGE_BITS),
+        VPN::new(stack_top_vpn - pages)..VPN::new(stack_top_vpn),
+        PPN::new(stack as usize >> VmMode::PAGE_BITS),
         VmFlags::build_from_str("_WRV"),
     );
     // 建立调度线程，目的是划分异常域。调度线程上发生内核异常时会回到这个控制流处理
     let mut scheduling = LocalContext::thread(schedule as _, false);
-    *scheduling.sp_mut() = 1 << 38;
+    
+    // RV64: 栈顶在虚拟地址高位
+    #[cfg(target_pointer_width = "64")]
+    {
+        *scheduling.sp_mut() = 1 << 38;
+    }
+    // RV32: 栈顶在较低的虚拟地址
+    #[cfg(target_pointer_width = "32")]
+    {
+        *scheduling.sp_mut() = stack_top_vpn << VmMode::PAGE_BITS;
+    }
+    
     unsafe { scheduling.execute() };
     log::error!("stval = {:#x}", stval::read());
     panic!("trap from scheduling thread: {:?}", scause::read().cause());
@@ -160,8 +195,8 @@ fn kernel_space(
     layout: linker::KernelLayout,
     memory: usize,
     portal: usize,
-) -> AddressSpace<Sv39, Sv39Manager> {
-    let mut space = AddressSpace::<Sv39, Sv39Manager>::new();
+) -> AddressSpace<VmMode, VmManager> {
+    let mut space = AddressSpace::<VmMode, VmManager>::new();
     for region in layout.iter() {
         log::info!("{region}");
         use linker::KernelRegionTitle::*;
@@ -170,8 +205,8 @@ fn kernel_space(
             Rodata => "__RV",
             Data | Boot => "_WRV",
         };
-        let s = VAddr::<Sv39>::new(region.range.start);
-        let e = VAddr::<Sv39>::new(region.range.end);
+        let s = VAddr::<VmMode>::new(region.range.start);
+        let e = VAddr::<VmMode>::new(region.range.end);
         space.map_extern(
             s.floor()..e.ceil(),
             PPN::new(s.floor().val()),
@@ -183,8 +218,8 @@ fn kernel_space(
         layout.end(),
         layout.start() + memory
     );
-    let s = VAddr::<Sv39>::new(layout.end());
-    let e = VAddr::<Sv39>::new(layout.start() + memory);
+    let s = VAddr::<VmMode>::new(layout.end());
+    let e = VAddr::<VmMode>::new(layout.start() + memory);
     space.map_extern(
         s.floor()..e.ceil(),
         PPN::new(s.floor().val()),
@@ -192,11 +227,17 @@ fn kernel_space(
     );
     space.map_extern(
         PROTAL_TRANSIT..PROTAL_TRANSIT + 1,
-        PPN::new(portal >> Sv39::PAGE_BITS),
+        PPN::new(portal >> VmMode::PAGE_BITS),
         VmFlags::build_from_str("__G_XWRV"),
     );
     println!();
+    
+    // 根据架构设置 satp
+    #[cfg(target_pointer_width = "64")]
     unsafe { satp::set(satp::Mode::Sv39, 0, space.root_ppn().val()) };
+    #[cfg(target_pointer_width = "32")]
+    unsafe { satp::set(satp::Mode::Sv32, 0, space.root_ppn().val()) };
+    
     space
 }
 
@@ -209,17 +250,20 @@ mod impls {
         ptr::NonNull,
         sync::atomic::{AtomicBool, Ordering},
     };
-    use kernel_vm::{
-        page_table::{MmuMeta, Pte, Sv39, VAddr, VmFlags, PPN, VPN},
-        PageManager,
-    };
+    use kernel_vm::PageManager;
     use riscv::register::time;
     use rcore_console::log;
     use syscall::*;
 
+    // ============ RV64 Sv39 支持 ============
+    #[cfg(target_pointer_width = "64")]
+    use kernel_vm::page_table::{MmuMeta, Pte, Sv39, VAddr, VmFlags, PPN, VPN};
+
+    #[cfg(target_pointer_width = "64")]
     #[repr(transparent)]
     pub struct Sv39Manager(NonNull<Pte<Sv39>>);
 
+    #[cfg(target_pointer_width = "64")]
     impl Sv39Manager {
         const OWNED: VmFlags<Sv39> = unsafe { VmFlags::from_raw(1 << 8) };
 
@@ -235,6 +279,7 @@ mod impls {
         }
     }
 
+    #[cfg(target_pointer_width = "64")]
     impl PageManager<Sv39> for Sv39Manager {
         #[inline]
         fn new_root() -> Self {
@@ -281,6 +326,77 @@ mod impls {
         }
     }
 
+    // ============ RV32 Sv32 支持 ============
+    #[cfg(target_pointer_width = "32")]
+    use kernel_vm::page_table::{MmuMeta, Pte, Sv32, VAddr, VmFlags, PPN, VPN};
+
+    #[cfg(target_pointer_width = "32")]
+    #[repr(transparent)]
+    pub struct Sv32Manager(NonNull<Pte<Sv32>>);
+
+    #[cfg(target_pointer_width = "32")]
+    impl Sv32Manager {
+        const OWNED: VmFlags<Sv32> = unsafe { VmFlags::from_raw(1 << 8) };
+
+        #[inline]
+        fn page_alloc<T>(count: usize) -> *mut T {
+            unsafe {
+                alloc_zeroed(Layout::from_size_align_unchecked(
+                    count << Sv32::PAGE_BITS,
+                    1 << Sv32::PAGE_BITS,
+                ))
+            }
+            .cast()
+        }
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    impl PageManager<Sv32> for Sv32Manager {
+        #[inline]
+        fn new_root() -> Self {
+            Self(NonNull::new(Self::page_alloc(1)).unwrap())
+        }
+
+        #[inline]
+        fn root_ppn(&self) -> PPN<Sv32> {
+            PPN::new(self.0.as_ptr() as usize >> Sv32::PAGE_BITS)
+        }
+
+        #[inline]
+        fn root_ptr(&self) -> NonNull<Pte<Sv32>> {
+            self.0
+        }
+
+        #[inline]
+        fn p_to_v<T>(&self, ppn: PPN<Sv32>) -> NonNull<T> {
+            unsafe { NonNull::new_unchecked(VPN::<Sv32>::new(ppn.val()).base().as_mut_ptr()) }
+        }
+
+        #[inline]
+        fn v_to_p<T>(&self, ptr: NonNull<T>) -> PPN<Sv32> {
+            PPN::new(VAddr::<Sv32>::new(ptr.as_ptr() as _).floor().val())
+        }
+
+        #[inline]
+        fn check_owned(&self, pte: Pte<Sv32>) -> bool {
+            pte.flags().contains(Self::OWNED)
+        }
+
+        #[inline]
+        fn allocate(&mut self, len: usize, flags: &mut VmFlags<Sv32>) -> NonNull<u8> {
+            *flags |= Self::OWNED;
+            NonNull::new(Self::page_alloc(len)).unwrap()
+        }
+
+        fn deallocate(&mut self, _pte: Pte<Sv32>, _len: usize) -> usize {
+            todo!()
+        }
+
+        fn drop_root(&mut self) {
+            todo!()
+        }
+    }
+
     pub struct Console;
 
     impl rcore_console::Console for Console {
@@ -293,11 +409,17 @@ mod impls {
 
     pub struct SyscallContext;
 
+    // 使用 crate 级别的类型别名
+    #[cfg(target_pointer_width = "64")]
+    type VmModeLocal = Sv39;
+    #[cfg(target_pointer_width = "32")]
+    type VmModeLocal = Sv32;
+
     impl IO for SyscallContext {
         fn write(&self, caller: Caller, fd: usize, buf: usize, count: usize) -> isize {
             match fd {
                 STDOUT | STDDEBUG => {
-                    const READABLE: VmFlags<Sv39> = VmFlags::build_from_str("RV");
+                    const READABLE: VmFlags<VmModeLocal> = VmFlags::build_from_str("RV");
                     if let Some(ptr) = unsafe { PROCESSES.get_mut(caller.entity) }
                         .unwrap()
                         .address_space
@@ -340,7 +462,7 @@ mod impls {
     impl Clock for SyscallContext {
         #[inline]
         fn clock_gettime(&self, caller: Caller, clock_id: ClockId, tp: usize) -> isize {
-            const WRITABLE: VmFlags<Sv39> = VmFlags::build_from_str("W_V");
+            const WRITABLE: VmFlags<VmModeLocal> = VmFlags::build_from_str("W_V");
             match clock_id {
                 ClockId::CLOCK_MONOTONIC => {
                     if let Some(mut ptr) = unsafe { PROCESSES.get(caller.entity) }
@@ -373,7 +495,15 @@ mod impls {
 
     #[inline]
     fn monotonic_time_ns() -> usize {
-        (time::read64() as u64 * 10000 / 125) as usize
+        #[cfg(target_pointer_width = "64")]
+        {
+            (time::read64() as u64 * 10000 / 125) as usize
+        }
+        #[cfg(target_pointer_width = "32")]
+        {
+            // RV32: 使用 rdtime 读取低32位
+            (time::read() as u64 * 10000 / 125) as usize
+        }
     }
 
     fn print_with_timestamp(s: &str) {

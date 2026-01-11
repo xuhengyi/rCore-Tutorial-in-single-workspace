@@ -1,10 +1,12 @@
 ﻿/// 应用程序元数据。
+/// 
+/// 根据目标架构，数据宽度可能是 32 位或 64 位。
 #[repr(C)]
 pub struct AppMeta {
-    base: u64,
-    step: u64,
-    count: u64,
-    first: u64,
+    base: usize,
+    step: usize,
+    count: usize,
+    first: usize,
 }
 
 impl AppMeta {
@@ -27,7 +29,7 @@ impl AppMeta {
 /// 应用程序迭代器。
 pub struct AppIterator {
     meta: &'static AppMeta,
-    i: u64,
+    i: usize,
 }
 
 impl Iterator for AppIterator {
@@ -37,16 +39,16 @@ impl Iterator for AppIterator {
         if self.i >= self.meta.count {
             None
         } else {
-            let i = self.i as usize;
+            let i = self.i;
             self.i += 1;
             unsafe {
                 let slice = core::slice::from_raw_parts(
                     &self.meta.first as *const _ as *const usize,
-                    (self.meta.count + 1) as _,
+                    self.meta.count + 1,
                 );
                 let pos = slice[i];
                 let size = slice[i + 1] - pos;
-                let base = self.meta.base as usize + i * self.meta.step as usize;
+                let base = self.meta.base + i * self.meta.step;
                 if base != 0 {
                     core::ptr::copy_nonoverlapping::<u8>(pos as _, base as _, size);
                     core::slice::from_raw_parts_mut(base as *mut u8, 0x20_0000)[size..].fill(0);

@@ -14,12 +14,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const TARGET_ARCH: &str = "riscv64gc-unknown-none-elf";
+const TARGET_ARCH_RV64: &str = "riscv64gc-unknown-none-elf";
+const TARGET_ARCH_RV32: &str = "riscv32imac-unknown-none-elf";
 
 static PROJECT: Lazy<&'static Path> =
     Lazy::new(|| Path::new(std::env!("CARGO_MANIFEST_DIR")).parent().unwrap());
 
-static TARGET: Lazy<PathBuf> = Lazy::new(|| PROJECT.join("target").join(TARGET_ARCH));
+fn get_target_dir(arch: &str) -> PathBuf {
+    PROJECT.join("target").join(arch)
+}
 
 #[derive(Parser)]
 #[clap(name = "rCore-Tutorial")]
@@ -47,6 +50,34 @@ fn main() {
     }
 }
 
+/// Architecture selection
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum Arch {
+    /// RISC-V 64-bit
+    #[default]
+    Riscv64,
+    /// RISC-V 32-bit
+    Riscv32,
+}
+
+impl Arch {
+    /// Returns the target triple for this architecture
+    fn target(&self) -> &'static str {
+        match self {
+            Arch::Riscv64 => TARGET_ARCH_RV64,
+            Arch::Riscv32 => TARGET_ARCH_RV32,
+        }
+    }
+    
+    /// Returns the QEMU system name for this architecture
+    fn qemu_system(&self) -> &'static str {
+        match self {
+            Arch::Riscv64 => "riscv64",
+            Arch::Riscv32 => "riscv32",
+        }
+    }
+}
+
 #[derive(Args, Default)]
 struct BuildArgs {
     /// chapter number
@@ -55,6 +86,9 @@ struct BuildArgs {
     /// lab or not
     #[clap(long)]
     lab: bool,
+    /// target architecture (riscv64 or riscv32)
+    #[clap(short, long, value_enum, default_value_t = Arch::Riscv64)]
+    arch: Arch,
     /// features
     #[clap(short, long)]
     features: Option<String>,
@@ -71,14 +105,16 @@ struct BuildArgs {
 
 impl BuildArgs {
     fn make(&self) -> PathBuf {
+        let target_arch = self.arch.target();
+        let target_dir = get_target_dir(target_arch);
         let mut env: HashMap<&str, OsString> = HashMap::new();
         let package = match self.ch {
             1 => if self.lab { "ch1-lab" } else { "ch1" }.to_string(),
             2..=8 => {
-                user::build_for(self.ch, false);
+                user::build_for(self.ch, false, self.arch);
                 env.insert(
                     "APP_ASM",
-                    TARGET
+                    target_dir
                         .join("debug")
                         .join("app.asm")
                         .as_os_str()
@@ -104,12 +140,12 @@ impl BuildArgs {
             .conditional(self.nobios, |cargo| {
                 cargo.features(false, ["nobios"]);
             })
-            .target(TARGET_ARCH);
+            .target(target_arch);
         for (key, value) in env {
             build.env(key, value);
         }
         build.invoke();
-        TARGET
+        target_dir
             .join(if self.release { "release" } else { "debug" })
             .join(package)
     }
@@ -153,11 +189,13 @@ struct QemuArgs {
 
 impl QemuArgs {
     fn run(self) {
+        let target_arch = self.build.arch.target();
+        let target_dir = get_target_dir(target_arch);
         let elf = self.build.make();
         if let Some(p) = &self.qemu_dir {
             Qemu::search_at(p);
         }
-        let mut qemu = Qemu::system("riscv64");
+        let mut qemu = Qemu::system(self.build.arch.qemu_system());
         qemu.args(&["-machine", "virt"])
             .arg("-nographic");
 
@@ -168,11 +206,19 @@ impl QemuArgs {
                 .arg("-kernel")
                 .arg(objcopy(&elf, true));
         } else {
-            // 使用 RustSBI 模式
-            qemu.arg("-bios")
-                .arg(PROJECT.join("rustsbi-qemu.bin"))
-                .arg("-kernel")
-                .arg(objcopy(&elf, true));
+            // 使用 RustSBI 模式 (仅支持 riscv64)
+            if self.build.arch == Arch::Riscv32 {
+                eprintln!("Warning: RustSBI mode is only supported for riscv64. Use --nobios for riscv32.");
+                eprintln!("Falling back to nobios mode for riscv32...");
+                qemu.args(&["-bios", "none"])
+                    .arg("-kernel")
+                    .arg(objcopy(&elf, true));
+            } else {
+                qemu.arg("-bios")
+                    .arg(PROJECT.join("rustsbi-qemu.bin"))
+                    .arg("-kernel")
+                    .arg(objcopy(&elf, true));
+            }
         }
 
         qemu.args(&["-smp", &self.smp.unwrap_or(1).to_string()])
@@ -184,7 +230,7 @@ impl QemuArgs {
                 "-drive",
                 format!(
                     "file={},if=none,format=raw,id=x0",
-                    TARGET
+                    target_dir
                         .join(if self.build.release {
                             "release"
                         } else {

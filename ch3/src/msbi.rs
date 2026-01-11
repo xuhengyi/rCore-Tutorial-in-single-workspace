@@ -149,10 +149,28 @@ fn handle_base(fid: usize) -> SbiRet {
 /// Handle timer extension (EID 0x54494D45)
 fn handle_timer(time: u64) -> SbiRet {
     // Set mtimecmp for the timer interrupt
+    // CLINT mtimecmp register address
     const CLINT_MTIMECMP: usize = 0x200_4000;
+    
+    #[cfg(target_pointer_width = "64")]
     unsafe {
         (CLINT_MTIMECMP as *mut u64).write_volatile(time);
     }
+    
+    #[cfg(target_pointer_width = "32")]
+    unsafe {
+        // For RV32, mtimecmp is a 64-bit register accessed as two 32-bit halves
+        // Write high word first to avoid spurious interrupts
+        let mtimecmp_lo = CLINT_MTIMECMP as *mut u32;
+        let mtimecmp_hi = (CLINT_MTIMECMP + 4) as *mut u32;
+        // Set high word to max first to prevent spurious interrupt
+        mtimecmp_hi.write_volatile(u32::MAX);
+        // Set low word
+        mtimecmp_lo.write_volatile(time as u32);
+        // Set high word to actual value
+        mtimecmp_hi.write_volatile((time >> 32) as u32);
+    }
+    
     // Clear pending timer interrupt by clearing STIP
     unsafe {
         core::arch::asm!(

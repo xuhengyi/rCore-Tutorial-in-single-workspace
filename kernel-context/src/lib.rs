@@ -136,14 +136,41 @@ impl LocalContext {
         let ctx_ptr = self as *mut Self;
         let mut sepc = self.sepc;
         let old_sscratch: usize;
+        
+        #[cfg(target_pointer_width = "64")]
+        core::arch::asm!(
+            "   csrrw {old_ss}, sscratch, {ctx}
+                csrw  sepc    , {sepc}
+                csrw  sstatus , {sstatus}
+                addi  sp, sp, -16
+                sd    ra, 0(sp)
+                sd    {old_ss}, 8(sp)
+                call  {execute_naked}
+                ld    {old_ss}, 8(sp)
+                ld    ra, 0(sp)
+                addi  sp, sp,  16
+                csrw  sscratch, {old_ss}
+                csrr  {sepc}   , sepc
+                csrr  {sstatus}, sstatus
+            ",
+            ctx           = in       (reg) ctx_ptr,
+            old_ss        = out      (reg) old_sscratch,
+            sepc          = inlateout(reg) sepc,
+            sstatus       = inlateout(reg) sstatus,
+            execute_naked = sym execute_naked_rv64,
+        );
+        
+        #[cfg(target_pointer_width = "32")]
         core::arch::asm!(
             "   csrrw {old_ss}, sscratch, {ctx}
                 csrw  sepc    , {sepc}
                 csrw  sstatus , {sstatus}
                 addi  sp, sp, -8
-                sd    ra, (sp)
+                sw    ra, 0(sp)
+                sw    {old_ss}, 4(sp)
                 call  {execute_naked}
-                ld    ra, (sp)
+                lw    {old_ss}, 4(sp)
+                lw    ra, 0(sp)
                 addi  sp, sp,  8
                 csrw  sscratch, {old_ss}
                 csrr  {sepc}   , sepc
@@ -153,8 +180,9 @@ impl LocalContext {
             old_ss        = out      (reg) old_sscratch,
             sepc          = inlateout(reg) sepc,
             sstatus       = inlateout(reg) sstatus,
-            execute_naked = sym execute_naked,
+            execute_naked = sym execute_naked_rv32,
         );
+        
         let _ = old_sscratch; // suppress unused warning
         (*ctx_ptr).sepc = sepc;
         sstatus
@@ -179,15 +207,16 @@ fn build_sstatus(supervisor: bool, interrupt: bool) -> usize {
     sstatus
 }
 
-/// 线程切换核心部分。
+/// 线程切换核心部分 (RV64)。
 ///
 /// 通用寄存器压栈，然后从预存在 `sscratch` 里的上下文指针恢复线程通用寄存器。
 ///
 /// # Safety
 ///
 /// 裸函数。
+#[cfg(target_pointer_width = "64")]
 #[unsafe(naked)]
-unsafe extern "C" fn execute_naked() {
+unsafe extern "C" fn execute_naked_rv64() {
     core::arch::naked_asm!(
         r"  .altmacro
             .macro SAVE n
@@ -251,6 +280,86 @@ unsafe extern "C" fn execute_naked() {
         // 恢复调度上下文
         "   LOAD_ALL
             addi sp, sp, 32*8
+        ",
+        // 返回调度
+        "   ret",
+        "   .option pop",
+    )
+}
+
+/// 线程切换核心部分 (RV32)。
+///
+/// 通用寄存器压栈，然后从预存在 `sscratch` 里的上下文指针恢复线程通用寄存器。
+///
+/// # Safety
+///
+/// 裸函数。
+#[cfg(target_pointer_width = "32")]
+#[unsafe(naked)]
+unsafe extern "C" fn execute_naked_rv32() {
+    core::arch::naked_asm!(
+        r"  .altmacro
+            .macro SAVE n
+                sw x\n, \n*4(sp)
+            .endm
+            .macro SAVE_ALL
+                sw x1, 1*4(sp)
+                .set n, 3
+                .rept 29
+                    SAVE %n
+                    .set n, n+1
+                .endr
+            .endm
+
+            .macro LOAD n
+                lw x\n, \n*4(sp)
+            .endm
+            .macro LOAD_ALL
+                lw x1, 1*4(sp)
+                .set n, 3
+                .rept 29
+                    LOAD %n
+                    .set n, n+1
+                .endr
+            .endm
+        ",
+        // 位置无关加载
+        "   .option push
+            .option nopic
+        ",
+        // 保存调度上下文
+        "   addi sp, sp, -32*4
+            SAVE_ALL
+        ",
+        // 设置陷入入口
+        "   la   t0, 1f
+            csrw stvec, t0
+        ",
+        // 保存调度上下文地址并切换上下文
+        "   csrr t0, sscratch
+            sw   sp, (t0)
+            mv   sp, t0
+        ",
+        // 恢复线程上下文
+        "   LOAD_ALL
+            lw   sp, 2*4(sp)
+        ",
+        // 执行线程
+        "   sret",
+        // 陷入
+        "   .align 2",
+        // 切换上下文
+        "1: csrrw sp, sscratch, sp",
+        // 保存线程上下文
+        "   SAVE_ALL
+            csrrw t0, sscratch, sp
+            sw    t0, 2*4(sp)
+        ",
+        // 切换上下文
+        "   lw sp, (sp)",
+        // 恢复调度上下文
+        "   LOAD_ALL
+            addi sp, sp, 32*4
         ",
         // 返回调度
         "   ret",

@@ -161,8 +161,13 @@ static PORTAL_TEXT: Lazy<PortalText> = Lazy::new(PortalText::new);
 impl PortalText {
     pub fn new() -> Self {
         // 32 是一个任取的不可能的下限
+        #[cfg(target_pointer_width = "64")]
+        let func_ptr = foreign_execute_rv64 as *const u16;
+        #[cfg(target_pointer_width = "32")]
+        let func_ptr = foreign_execute_rv32 as *const u16;
+        
         for len in 32.. {
-            let slice = unsafe { core::slice::from_raw_parts(foreign_execute as *const _, len) };
+            let slice = unsafe { core::slice::from_raw_parts(func_ptr, len) };
             // 裸函数的 `options(noreturn)` 会在结尾生成一个 0 指令，这是一个 unstable 特性所以不一定可靠
             if slice.ends_with(&[0x8502, 0]) {
                 return Self(slice);
@@ -183,10 +188,11 @@ impl PortalText {
     }
 }
 
-/// 切换地址空间然后 sret。
+/// 切换地址空间然后 sret (RV64)。
 /// 地址空间恢复后一切都会恢复原状。
+#[cfg(target_pointer_width = "64")]
 #[unsafe(naked)]
-unsafe extern "C" fn foreign_execute(ctx: *mut PortalCache) {
+unsafe extern "C" fn foreign_execute_rv64(_ctx: *mut PortalCache) {
     core::arch::naked_asm!(
         // 位置无关加载
         "   .option push
@@ -244,6 +250,77 @@ unsafe extern "C" fn foreign_execute(ctx: *mut PortalCache) {
         "   ld    a1, 1*8(a0)",
         // 恢复陷入入口
         "   ld    a0, 5*8(a0)
+            csrw      stvec, a0
+        ",
+        // 回家！
+        // 离开异界传送门直接跳到正常上下文的 stvec
+        "   jr    a0",
+        "   .option pop",
+    )
+}
+
+/// 切换地址空间然后 sret (RV32)。
+/// 地址空间恢复后一切都会恢复原状。
+#[cfg(target_pointer_width = "32")]
+#[unsafe(naked)]
+unsafe extern "C" fn foreign_execute_rv32(_ctx: *mut PortalCache) {
+    core::arch::naked_asm!(
+        // 位置无关加载
+        "   .option push
+            .option nopic
+        ",
+        // 保存 ra，ra 会用来寄存
+        "   sw    a1, 1*4(a0)",
+        // 交换地址空间
+        "   lw    a1, 2*4(a0)
+            csrrw a1, satp, a1
+            sfence.vma
+            sw    a1, 2*4(a0)
+        ",
+        // 加载 sstatus
+        "   lw    a1, 3*4(a0)
+            csrw      sstatus, a1
+        ",
+        // 加载 sepc
+        "   lw    a1, 4*4(a0)
+            csrw      sepc, a1
+        ",
+        // 交换陷入入口
+        "   la    a1, 1f
+            csrrw a1, stvec, a1
+            sw    a1, 5*4(a0)
+        ",
+        // 交换 sscratch
+        "   csrrw a1, sscratch, a0
+            sw    a1, 6*4(a0)
+        ",
+        // 加载通用寄存器
+        "   lw    a1, 1*4(a0)
+            lw    a0,    (a0)
+        ",
+        // 出发！
+        "   sret",
+        // 陷入
+        "   .align 2",
+        // 加载 a0
+        "1: csrrw a0, sscratch, a0",
+        // 保存 ra，ra 会用来寄存
+        "   sw    a1, 1*4(a0)",
+        // 交换 sscratch 并保存 a0
+        "   lw    a1, 6*4(a0)
+            csrrw a1, sscratch, a1
+            sw    a1,    (a0)
+        ",
+        // 恢复地址空间
+        "   lw    a1, 2*4(a0)
+            csrrw a1, satp, a1
+            sfence.vma
+            sw    a1, 2*4(a0)
+        ",
+        // 恢复通用寄存器
+        "   lw    a1, 1*4(a0)",
+        // 恢复陷入入口
+        "   lw    a0, 5*4(a0)
             csrw      stvec, a0
         ",
         // 回家！

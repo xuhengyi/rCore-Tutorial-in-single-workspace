@@ -22,11 +22,15 @@ core::arch::global_asm!(include_str!(env!("APP_ASM")));
 const APP_CAPACITY: usize = 32;
 
 // M-Mode 入口汇编（仅在 nobios 模式下）
-#[cfg(feature = "nobios")]
-core::arch::global_asm!(include_str!("m_entry.S"));
+// 根据目标架构选择正确的汇编文件
+#[cfg(all(feature = "nobios", target_pointer_width = "64"))]
+core::arch::global_asm!(include_str!("m_entry_rv64.S"));
+
+#[cfg(all(feature = "nobios", target_pointer_width = "32"))]
+core::arch::global_asm!(include_str!("m_entry_rv32.S"));
 
 // 定义内核入口。
-linker::boot0!(rust_main; stack = (APP_CAPACITY + 2) * 4096);
+linker::boot0!(rust_main; stack = (APP_CAPACITY * 5 + 2) * 4096);  // 增加栈大小以容纳更大的用户栈
 
 extern "C" fn rust_main() -> ! {
     // bss 段清零
@@ -91,7 +95,8 @@ extern "C" fn rust_main() -> ! {
                         }
                     }
                     Trap::Exception(e) => {
-                        log::error!("app{i} was killed by {e:?}");
+                        let sepc = sepc::read();
+                        log::error!("app{i} was killed by {e:?} at {sepc:#x}");
                         true
                     }
                     Trap::Interrupt(ir) => {

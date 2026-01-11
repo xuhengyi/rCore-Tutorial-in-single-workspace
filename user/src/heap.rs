@@ -20,7 +20,14 @@ pub fn init() {
 }
 
 type MutAllocator<const N: usize> = BuddyAllocator<N, UsizeBuddy, LinkedListBuddy>;
+
+// RV64: 使用 32 层 buddy allocator (64-bit usize 支持更大的层级)
+#[cfg(target_pointer_width = "64")]
 static mut HEAP: MutAllocator<32> = MutAllocator::new();
+
+// RV32: 使用 20 层 buddy allocator (32-bit usize 会在层级过高时导致位移溢出)
+#[cfg(target_pointer_width = "32")]
+static mut HEAP: MutAllocator<20> = MutAllocator::new();
 
 struct Global;
 
